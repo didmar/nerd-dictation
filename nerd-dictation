@@ -17,6 +17,13 @@ import sys
 import tempfile
 import time
 
+# Third-party modules.
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+
 # Types.
 from typing import (
     Dict,
@@ -1266,6 +1273,696 @@ def text_from_vosk_pipe(
     return handled_any
 
 
+# -----------------------------------------------------------------------------
+# Text from AssemblyAI
+#
+
+def text_from_assemblyai_stream(
+    *,
+    assemblyai_api_key: str,
+    exit_fn: Callable[..., int],
+    process_fn: Callable[[str], str],
+    handle_fn: Callable[[int, str], None],
+    timeout: float,
+    idle_time: float,
+    progressive: bool,
+    progressive_continuous: bool,
+    sample_rate: int = 16000,
+    suspend_on_start: bool = False,
+    verbose: int = 0,
+) -> bool:
+    """
+    Text from AssemblyAI streaming API.
+    """
+    try:
+        import assemblyai as aai
+        from assemblyai.streaming.v3 import (
+            BeginEvent,
+            StreamingClient,
+            StreamingClientOptions,
+            StreamingError,
+            StreamingEvents,
+            StreamingParameters,
+            TerminationEvent,
+            TurnEvent,
+        )
+    except ImportError:
+        sys.stderr.write("AssemblyAI package not found. Install with: pip install 'assemblyai[extras]'\n")
+        sys.exit(1)
+
+    if not assemblyai_api_key:
+        sys.stderr.write("AssemblyAI API key is required. Set ASSEMBLYAI_API_KEY in your .env file.\n")
+        sys.exit(1)
+
+    # Collect the output used when time-out is enabled.
+    if not (progressive and progressive_continuous):
+        text_list: List[str] = []
+
+    # Set true if handle has been called.
+    handled_any = False
+
+    if progressive:
+        text_prev = ""
+
+    # For timeout functionality
+    use_timeout = timeout != 0.0
+    if use_timeout:
+        timeout_time_prev = time.time()
+
+    # Track this to prevent excessive load when the "partial" result doesn't change.
+    partial_text_prev = ""
+
+    # -----------------------------
+    # Utilities for Text Processing
+
+    def handle_fn_suspended() -> None:
+        nonlocal handled_any
+        nonlocal text_prev
+        nonlocal partial_text_prev
+
+        handled_any = False
+        text_prev = ""
+        partial_text_prev = ""
+
+        if not (progressive and progressive_continuous):
+            text_list.clear()
+
+    def handle_fn_wrapper(text: str, is_partial_arg: bool) -> None:
+        nonlocal handled_any
+        nonlocal text_prev
+        nonlocal timeout_time_prev
+
+        # Update timeout tracking when we get new text
+        if use_timeout:
+            timeout_time_prev = time.time()
+
+        # Simple deferred text input, just accumulate values in a list (finish entering text on exit).
+        if not progressive:
+            if is_partial_arg:
+                return
+            text_list.append(text)
+            handled_any = True
+            return
+
+        # Progressive support (type as you speak).
+        if progressive_continuous:
+            text_curr = process_fn(text)
+        else:
+            text_curr = process_fn(" ".join(text_list + [text]))
+
+        if text_curr != text_prev:
+            match = min(len(text_curr), len(text_prev))
+            for i in range(min(len(text_curr), len(text_prev))):
+                if text_curr[i] != text_prev[i]:
+                    match = i
+                    break
+
+            # Emit text, deleting any previous incorrectly transcribed output
+            handle_fn(len(text_prev) - match, text_curr[match:])
+
+            text_prev = text_curr
+
+        if not is_partial_arg:
+            if progressive_continuous:
+                text_prev = ""
+            else:
+                text_list.append(text)
+
+        handled_any = True
+
+    # -----------------------------------------------
+    # AssemblyAI Event Handlers
+
+    def on_begin(client, event: BeginEvent) -> None:
+        if verbose >= 1:
+            sys.stderr.write(f"AssemblyAI session started: {event.id}\n")
+
+    def on_turn(client, event: TurnEvent) -> None:
+        nonlocal partial_text_prev
+        
+        if event.end_of_turn and event.turn_is_formatted:
+            # Final result
+            if event.transcript:
+                handle_fn_wrapper(event.transcript, False)
+        else:
+            # Partial result - only process if it's different from previous
+            if event.transcript != partial_text_prev:
+                partial_text_prev = event.transcript
+                if event.transcript:
+                    handle_fn_wrapper(event.transcript, True)
+
+    def on_terminated(client, event: TerminationEvent) -> None:
+        if verbose >= 1:
+            sys.stderr.write(f"AssemblyAI session terminated: {event.audio_duration_seconds} seconds of audio processed\n")
+
+    def on_error(client, error: StreamingError) -> None:
+        sys.stderr.write(f"AssemblyAI error occurred: {error}\n")
+
+    if not suspend_on_start:
+        # Support setting up input simulation state.
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
+
+    # Use code to delay exiting, allowing reading the recording buffer to catch-up.
+    code = 0
+
+    # ---------------
+    # Signal Handling
+
+    suspend = suspend_on_start
+
+    from types import FrameType
+
+    client = None
+    streaming_active = False
+
+    def do_suspend_pause() -> None:
+        nonlocal client, streaming_active
+        
+        # Clear the buffer:
+        handle_fn_suspended()
+
+        if verbose >= 1:
+            sys.stderr.write("Recording suspended.\n")
+
+        # Disconnect from AssemblyAI
+        if client and streaming_active:
+            try:
+                client.disconnect(terminate=True)
+            except:
+                pass  # Ignore errors during disconnect
+            streaming_active = False
+
+    def do_suspend_resume() -> None:
+        nonlocal client, streaming_active
+
+        if verbose >= 1:
+            sys.stderr.write("Recording.\n")
+
+        # Reconnect to AssemblyAI
+        if client and not streaming_active:
+            try:
+                client.connect(
+                    StreamingParameters(
+                        sample_rate=sample_rate,
+                        format_turns=True,
+                    )
+                )
+                streaming_active = True
+            except Exception as ex:
+                sys.stderr.write(f"Failed to reconnect to AssemblyAI: {ex}\n")
+
+    def handle_sig_suspend_from_usr1(_signum: int, _frame: Optional[FrameType]) -> None:
+        nonlocal suspend
+        if suspend:
+            return
+        suspend = True
+        do_suspend_pause()
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    def handle_sig_resume_from_cont(_signum: int, _frame: Optional[FrameType]) -> None:
+        nonlocal suspend
+        if not suspend:
+            return
+        suspend = False
+
+    def handle_sig_reload_from_hup(_signum: int, _frame: Optional[FrameType]) -> None:
+        if verbose >= 1:
+            sys.stderr.write("Reload.\n")
+        process_fn("")
+
+    import signal
+
+    # Suspend resume from separate signals.
+    signal.signal(signal.SIGUSR1, handle_sig_suspend_from_usr1)
+    signal.signal(signal.SIGTSTP, handle_sig_suspend_from_usr1)
+    signal.signal(signal.SIGCONT, handle_sig_resume_from_cont)
+    signal.signal(signal.SIGHUP, handle_sig_reload_from_hup)
+
+    # Initialize AssemblyAI client
+    try:
+        client = StreamingClient(
+            StreamingClientOptions(
+                api_key=assemblyai_api_key,
+                api_host="streaming.assemblyai.com",
+            )
+        )
+
+        client.on(StreamingEvents.Begin, on_begin)
+        client.on(StreamingEvents.Turn, on_turn)
+        client.on(StreamingEvents.Termination, on_terminated)
+        client.on(StreamingEvents.Error, on_error)
+
+        if not suspend_on_start:
+            client.connect(
+                StreamingParameters(
+                    sample_rate=sample_rate,
+                    format_turns=True,
+                )
+            )
+            streaming_active = True
+
+        if verbose >= 1:
+            sys.stderr.write("AssemblyAI client initialized.\n")
+
+    except Exception as ex:
+        sys.stderr.write(f"Failed to initialize AssemblyAI client: {ex}\n")
+        sys.exit(1)
+
+    if suspend:
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    # ---------
+    # Main Loop
+
+    if idle_time > 0.0:
+        idle_time_prev = time.time()
+
+    try:
+        # For AssemblyAI, we need to start streaming immediately and handle the main loop differently
+        if not suspend and client:
+            try:
+                client.stream(aai.extras.MicrophoneStream(sample_rate=sample_rate))
+                streaming_active = True
+            except Exception as ex:
+                sys.stderr.write(f"Failed to start streaming: {ex}\n")
+                return False
+
+        while code == 0:
+            # -1=cancel, 0=continue, 1=finish.
+            code = exit_fn(handled_any)
+
+            if suspend:
+                continue
+
+            if idle_time > 0.0:
+                idle_time_curr = time.time()
+                idle_time_test = idle_time - (idle_time_curr - idle_time_prev)
+                if idle_time_test > 0.0:
+                    time.sleep(idle_time_test)
+                    idle_time_prev = time.time()
+                else:
+                    idle_time_prev = idle_time_curr
+
+            # Check timeout
+            if use_timeout:
+                if time.time() - timeout_time_prev > timeout:
+                    if code == 0:
+                        code = 1  # The time was exceeded, exit!
+
+            # Small delay to prevent excessive CPU usage
+            time.sleep(0.01)
+
+    except KeyboardInterrupt:
+        code = -1
+    except Exception as ex:
+        sys.stderr.write(f"Error in main loop: {ex}\n")
+        code = -1
+    finally:
+        # Cleanup
+        if client and streaming_active:
+            try:
+                client.disconnect(terminate=True)
+            except:
+                pass  # Ignore errors during cleanup
+
+        # Support setting up input simulation state.
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
+
+    if code == -1:
+        sys.stderr.write("Text input canceled!\n")
+        sys.exit(0)
+
+    if not progressive:
+        # We never arrive here needing deletions
+        handle_fn(0, process_fn(" ".join(text_list)))
+
+    return handled_any
+
+
+# -----------------------------------------------------------------------------
+# Text from Faster-Whisper
+#
+
+def text_from_faster_whisper(
+    *,
+    faster_whisper_model_size: str,
+    faster_whisper_device: str,
+    faster_whisper_compute_type: str,
+    exit_fn: Callable[..., int],
+    process_fn: Callable[[str], str],
+    handle_fn: Callable[[int, str], None],
+    timeout: float,
+    idle_time: float,
+    progressive: bool,
+    progressive_continuous: bool,
+    sample_rate: int,
+    input_method: str,
+    pulse_device_name: str = "",
+    suspend_on_start: bool = False,
+    verbose: int = 0,
+) -> bool:
+    """
+    Text from Faster-Whisper speech recognition.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        sys.stderr.write("faster-whisper package not found. Install with: pip install faster-whisper\n")
+        sys.exit(1)
+
+    import tempfile
+    import wave
+    import threading
+    import queue
+    import struct
+    import signal
+    
+    # Audio chunk size for processing (in samples)
+    chunk_size = sample_rate * 2  # 2 seconds of audio
+    
+    # Collect the output used when time-out is enabled.
+    if not (progressive and progressive_continuous):
+        text_list: List[str] = []
+
+    # Set true if handle has been called.
+    handled_any = False
+
+    if progressive:
+        text_prev = ""
+
+    # For timeout functionality
+    use_timeout = timeout != 0.0
+    if use_timeout:
+        timeout_time_prev = time.time()
+
+    # Audio processing queue
+    audio_queue: queue.Queue = queue.Queue()
+    
+    # -----------------------------
+    # Utilities for Text Processing
+
+    def handle_fn_suspended() -> None:
+        nonlocal handled_any
+        nonlocal text_prev
+
+        handled_any = False
+        text_prev = ""
+
+        if not (progressive and progressive_continuous):
+            text_list.clear()
+
+    def handle_fn_wrapper(text: str, is_partial_arg: bool) -> None:
+        nonlocal handled_any
+        nonlocal text_prev
+        nonlocal timeout_time_prev
+
+        # Update timeout tracking when we get new text
+        if use_timeout and text:
+            timeout_time_prev = time.time()
+
+        # Simple deferred text input, just accumulate values in a list (finish entering text on exit).
+        if not progressive:
+            if is_partial_arg:
+                return
+            text_list.append(text)
+            handled_any = True
+            return
+
+        # Progressive support (type as you speak).
+        if progressive_continuous:
+            text_curr = process_fn(text)
+        else:
+            text_curr = process_fn(" ".join(text_list + [text]))
+
+        if text_curr != text_prev:
+            match = min(len(text_curr), len(text_prev))
+            for i in range(min(len(text_curr), len(text_prev))):
+                if text_curr[i] != text_prev[i]:
+                    match = i
+                    break
+
+            # Emit text, deleting any previous incorrectly transcribed output
+            handle_fn(len(text_prev) - match, text_curr[match:])
+
+            text_prev = text_curr
+
+        if not is_partial_arg:
+            if progressive_continuous:
+                text_prev = ""
+            else:
+                text_list.append(text)
+
+        handled_any = True
+
+    # -----------------------------------------------
+    # Faster-Whisper Setup
+
+    if verbose >= 1:
+        sys.stderr.write("Loading Faster-Whisper model...\n")
+
+    try:
+        model = WhisperModel(
+            faster_whisper_model_size,
+            device=faster_whisper_device,
+            compute_type=faster_whisper_compute_type
+        )
+    except Exception as ex:
+        sys.stderr.write(f"Failed to load Faster-Whisper model: {ex}\n")
+        sys.exit(1)
+
+    if verbose >= 1:
+        sys.stderr.write("Faster-Whisper model loaded.\n")
+
+    # -----------------------------------------------
+    # Audio Processing
+
+    def recording_proc_start() -> "Tuple[subprocess.Popen[bytes], IO[bytes]]":
+        return recording_proc_with_non_blocking_stdout(input_method, sample_rate, pulse_device_name)
+
+    has_ps = False
+    if not suspend_on_start:
+        ps, stdout = recording_proc_start()
+        has_ps = True
+
+    if not suspend_on_start:
+        # Support setting up input simulation state.
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
+
+    # Use code to delay exiting, allowing reading the recording buffer to catch-up.
+    code = 0
+
+    # ---------------
+    # Signal Handling
+
+    suspend = suspend_on_start
+
+    from types import FrameType
+
+    def do_suspend_pause() -> None:
+        nonlocal has_ps, ps, stdout
+        
+        # Clear the buffer and audio queue
+        handle_fn_suspended()
+        while not audio_queue.empty():
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if verbose >= 1:
+            sys.stderr.write("Recording suspended.\n")
+
+        # Close the recording process.
+        if has_ps:
+            handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
+            stdout.close()
+            os.kill(ps.pid, signal.SIGINT)
+            del stdout, ps
+            has_ps = False
+
+    def do_suspend_resume() -> None:
+        nonlocal has_ps, ps, stdout
+
+        if verbose >= 1:
+            sys.stderr.write("Recording.\n")
+
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
+        ps, stdout = recording_proc_start()
+        has_ps = True
+
+    def handle_sig_suspend_from_usr1(_signum: int, _frame: Optional[FrameType]) -> None:
+        nonlocal suspend
+        if suspend:
+            return
+        suspend = True
+        do_suspend_pause()
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    def handle_sig_resume_from_cont(_signum: int, _frame: Optional[FrameType]) -> None:
+        nonlocal suspend
+        if not suspend:
+            return
+        suspend = False
+
+    def handle_sig_reload_from_hup(_signum: int, _frame: Optional[FrameType]) -> None:
+        if verbose >= 1:
+            sys.stderr.write("Reload.\n")
+        process_fn("")
+
+    # Suspend resume from separate signals.
+    signal.signal(signal.SIGUSR1, handle_sig_suspend_from_usr1)
+    signal.signal(signal.SIGTSTP, handle_sig_suspend_from_usr1)
+    signal.signal(signal.SIGCONT, handle_sig_resume_from_cont)
+    signal.signal(signal.SIGHUP, handle_sig_reload_from_hup)
+
+    if suspend:
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+    # -----------------------------------------------
+    # Audio Processing Thread
+
+    def process_audio_chunks():
+        """Process audio chunks using Faster-Whisper in a separate thread."""
+        audio_buffer = bytearray()
+        
+        while True:
+            try:
+                # Get audio data from queue
+                chunk = audio_queue.get(timeout=0.1)
+                if chunk is None:  # Poison pill to stop thread
+                    break
+                    
+                audio_buffer.extend(chunk)
+                
+                # Process when we have enough audio data
+                if len(audio_buffer) >= chunk_size * 2:  # 2 bytes per sample (16-bit)
+                    # Create temporary WAV file
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                        tmp_path = tmp_file.name
+                        
+                        # Write WAV header and audio data
+                        with wave.open(tmp_path, 'wb') as wav_file:
+                            wav_file.setnchannels(1)  # Mono
+                            wav_file.setsampwidth(2)  # 16-bit
+                            wav_file.setframerate(sample_rate)
+                            wav_file.writeframes(audio_buffer[:chunk_size * 2])
+                    
+                    try:
+                        # Transcribe with Faster-Whisper
+                        segments, info = model.transcribe(
+                            tmp_path,
+                            beam_size=5,
+                            language=None,  # Auto-detect
+                            condition_on_previous_text=False
+                        )
+                        
+                        # Process segments
+                        for segment in segments:
+                            text = segment.text.strip()
+                            if text:
+                                handle_fn_wrapper(text, False)
+                                
+                    except Exception as ex:
+                        if verbose >= 1:
+                            sys.stderr.write(f"Transcription error: {ex}\n")
+                    finally:
+                        # Clean up temporary file
+                        try:
+                            os.unlink(tmp_path)
+                        except:
+                            pass
+                    
+                    # Remove processed audio from buffer
+                    audio_buffer = audio_buffer[chunk_size * 2:]
+                    
+            except queue.Empty:
+                continue
+            except Exception as ex:
+                if verbose >= 1:
+                    sys.stderr.write(f"Audio processing error: {ex}\n")
+
+    # Start audio processing thread
+    audio_thread = threading.Thread(target=process_audio_chunks, daemon=True)
+    audio_thread.start()
+
+    # ---------
+    # Main Loop
+
+    if idle_time > 0.0:
+        idle_time_prev = time.time()
+
+    # 1mb
+    block_size = 1_048_576
+
+    try:
+        while code == 0:
+            # -1=cancel, 0=continue, 1=finish.
+            code = exit_fn(handled_any)
+
+            if suspend:
+                continue
+
+            if idle_time > 0.0:
+                idle_time_curr = time.time()
+                idle_time_test = idle_time - (idle_time_curr - idle_time_prev)
+                if idle_time_test > 0.0:
+                    time.sleep(idle_time_test)
+                    idle_time_prev = time.time()
+                else:
+                    idle_time_prev = idle_time_curr
+
+            # Check timeout
+            if use_timeout:
+                if time.time() - timeout_time_prev > timeout:
+                    if code == 0:
+                        code = 1  # The time was exceeded, exit!
+
+            # Read audio data
+            try:
+                if has_ps:
+                    data = stdout.read(block_size)
+                    if data:
+                        # Add audio data to processing queue
+                        audio_queue.put(data)
+                else:
+                    # Start recording if not active
+                    do_suspend_resume()
+                    continue
+                    
+            except (NameError, ValueError):
+                # Start recording if stdout is not yet open or was closed
+                do_suspend_resume()
+                continue
+
+    except KeyboardInterrupt:
+        code = -1
+    except Exception as ex:
+        sys.stderr.write(f"Error in main loop: {ex}\n")
+        code = -1
+    finally:
+        # Cleanup
+        audio_queue.put(None)  # Poison pill to stop audio processing thread
+        if audio_thread.is_alive():
+            audio_thread.join(timeout=1.0)
+            
+        if has_ps:
+            os.kill(ps.pid, signal.SIGINT)
+            del ps, stdout
+            has_ps = False
+
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
+
+    if code == -1:
+        sys.stderr.write("Text input canceled!\n")
+        sys.exit(0)
+
+    if not progressive:
+        # We never arrive here needing deletions
+        handle_fn(0, process_fn(" ".join(text_list)))
+
+    return handled_any
+
+
 def main_begin(
     *,
     vosk_model_dir: str,
@@ -1273,6 +1970,7 @@ def main_begin(
     pulse_device_name: str = "",
     sample_rate: int = 44100,
     input_method: str = "PAREC",
+    speech_engine: str = "VOSK",
     progressive: bool = False,
     progressive_continuous: bool = False,
     full_sentence: bool = False,
@@ -1290,6 +1988,10 @@ def main_begin(
     suspend_on_start: bool = False,
     verbose: int = 0,
     vosk_grammar_file: str = "",
+    assemblyai_api_key: str = "",
+    faster_whisper_model_size: str = "base",
+    faster_whisper_device: str = "cpu",
+    faster_whisper_compute_type: str = "int8",
 ) -> None:
     """
     Initialize audio recording, then full text to speech conversion can take place.
@@ -1442,22 +2144,58 @@ def main_begin(
         # Unreachable.
         assert False
 
-    found_any = text_from_vosk_pipe(
-        vosk_model_dir=vosk_model_dir,
-        pulse_device_name=pulse_device_name,
-        sample_rate=sample_rate,
-        input_method=input_method,
-        timeout=timeout,
-        idle_time=idle_time,
-        progressive=progressive,
-        progressive_continuous=progressive_continuous,
-        exit_fn=exit_fn,
-        process_fn=process_fn,
-        handle_fn=handle_fn,
-        suspend_on_start=suspend_on_start,
-        verbose=verbose,
-        vosk_grammar_file=vosk_grammar_file,
-    )
+    found_any = False
+    if speech_engine == "VOSK":
+        found_any = text_from_vosk_pipe(
+            vosk_model_dir=vosk_model_dir,
+            pulse_device_name=pulse_device_name,
+            sample_rate=sample_rate,
+            input_method=input_method,
+            timeout=timeout,
+            idle_time=idle_time,
+            progressive=progressive,
+            progressive_continuous=progressive_continuous,
+            exit_fn=exit_fn,
+            process_fn=process_fn,
+            handle_fn=handle_fn,
+            suspend_on_start=suspend_on_start,
+            verbose=verbose,
+            vosk_grammar_file=vosk_grammar_file,
+        )
+    elif speech_engine == "ASSEMBLYAI":
+        found_any = text_from_assemblyai_stream(
+            assemblyai_api_key=assemblyai_api_key,
+            exit_fn=exit_fn,
+            process_fn=process_fn,
+            handle_fn=handle_fn,
+            timeout=timeout,
+            idle_time=idle_time,
+            progressive=progressive,
+            progressive_continuous=progressive_continuous,
+            sample_rate=sample_rate,
+            suspend_on_start=suspend_on_start,
+            verbose=verbose,
+        )
+    elif speech_engine == "FASTER_WHISPER":
+        found_any = text_from_faster_whisper(
+            faster_whisper_model_size=faster_whisper_model_size,
+            faster_whisper_device=faster_whisper_device,
+            faster_whisper_compute_type=faster_whisper_compute_type,
+            exit_fn=exit_fn,
+            process_fn=process_fn,
+            handle_fn=handle_fn,
+            timeout=timeout,
+            idle_time=idle_time,
+            progressive=progressive,
+            progressive_continuous=progressive_continuous,
+            sample_rate=sample_rate,
+            input_method=input_method,
+            pulse_device_name=pulse_device_name,
+            suspend_on_start=suspend_on_start,
+            verbose=verbose,
+        )
+    else:
+        raise Exception("Internal error, unknown speech engine: {!r}".format(speech_engine))
 
     if not found_any:
         sys.stderr.write("No text found in the audio\n")
@@ -1780,6 +2518,26 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     )
 
     subparse.add_argument(
+        "--speech-engine",
+        dest="speech_engine",
+        default="VOSK",
+        type=str,
+        metavar="SPEECH_ENGINE",
+        choices=("VOSK", "ASSEMBLYAI", "FASTER_WHISPER"),
+        help=(
+            "Specify speech recognition engine to use. Valid engines: VOSK, ASSEMBLYAI, FASTER_WHISPER.\n"
+            "\n"
+            "- ``VOSK`` (VOSK-API, default)\n"
+            "  Uses local VOSK models for offline speech recognition.\n"
+            "- ``ASSEMBLYAI`` (AssemblyAI streaming API)\n"
+            "  Uses AssemblyAI's cloud-based speech recognition service.\n"
+            "- ``FASTER_WHISPER`` (Faster-Whisper)\n"
+            "  Uses Faster-Whisper for offline speech recognition with OpenAI Whisper models.\n"
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
         "--output",
         dest="output",
         default="SIMULATE_INPUT",
@@ -1830,6 +2588,62 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     )
 
     subparse.add_argument(
+        "--assemblyai-api-key",
+        dest="assemblyai_api_key",
+        default="",
+        type=str,
+        metavar="API_KEY",
+        help=(
+            "API key for AssemblyAI streaming API.\n"
+            "Required for ``--speech-engine=ASSEMBLYAI``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--faster-whisper-model-size",
+        dest="faster_whisper_model_size",
+        default="base",
+        type=str,
+        metavar="MODEL_SIZE",
+        help=(
+            "Faster-Whisper model size to use. Valid sizes: tiny, base, small, medium, large-v1, large-v2, large-v3.\n"
+            "Defaults to 'base'. Larger models are more accurate but slower.\n"
+            "Required for ``--speech-engine=FASTER_WHISPER``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--faster-whisper-device",
+        dest="faster_whisper_device",
+        default="cpu",
+        type=str,
+        metavar="DEVICE",
+        help=(
+            "Device to run Faster-Whisper on: 'cpu' or 'cuda'.\n"
+            "Defaults to 'cpu'. GPU acceleration requires CUDA.\n"
+            "Required for ``--speech-engine=FASTER_WHISPER``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--faster-whisper-compute-type",
+        dest="faster_whisper_compute_type",
+        default="int8",
+        type=str,
+        metavar="COMPUTE_TYPE",
+        help=(
+            "Faster-Whisper compute type for quantization.\n"
+            "CPU: int8, int16, float16, float32. GPU: int8_float16, int8, float16, float32.\n"
+            "Defaults to 'int8'. Lower precision is faster but less accurate.\n"
+            "Required for ``--speech-engine=FASTER_WHISPER``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
         "-",
         dest="rest",
         default=False,
@@ -1847,6 +2661,7 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             pulse_device_name=args.pulse_device_name,
             sample_rate=args.sample_rate,
             input_method=args.input_method,
+            speech_engine=args.speech_engine,
             progressive=not (args.defer_output or args.output == "STDOUT"),
             progressive_continuous=args.progressive_continuous,
             full_sentence=args.full_sentence,
@@ -1864,6 +2679,10 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             suspend_on_start=args.suspend_on_start,
             verbose=args.verbose,
             vosk_grammar_file=args.vosk_grammar_file,
+            assemblyai_api_key=args.assemblyai_api_key or ASSEMBLYAI_API_KEY,
+            faster_whisper_model_size=args.faster_whisper_model_size,
+            faster_whisper_device=args.faster_whisper_device,
+            faster_whisper_compute_type=args.faster_whisper_compute_type,
         ),
     )
 

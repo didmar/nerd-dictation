@@ -7,3 +7,10 @@ __pycache__/
 
 # Fallback location used for the language model.
 /model
+
+# Build stuff
+build/
+package/python/build/
+package/python/doc/
+package/python/nerd-dictation
+package/python/nerd_dictation.egg-info/
