@@ -1,0 +1,26 @@
+[Unit]
+Description=Nerd Dictation Tray GUI
+Documentation=https://github.com/didmar/nerd-dictation
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=PLACEHOLDER_EXEC_START
+WorkingDirectory=PLACEHOLDER_WORKING_DIR
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables for GUI applications
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+
+# Ensure the service stops gracefully
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target 

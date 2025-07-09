@@ -1,0 +1,12 @@
+# Requirements for GTK AppIndicator3 GUI (Ubuntu/Gnome native)
+# Install with: pip install -r requirements-gui.txt
+
+# For GTK AppIndicator3 (recommended for Ubuntu)
+PyGObject
+
+# For pystray (cross-platform alternative)
+pystray
+Pillow
+
+# System packages needed (install with apt):
+# sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-appindicator3-0.1 
