@@ -2827,6 +2827,403 @@ def text_from_voxtral(
     return handled_any
 
 
+# -----------------------------------------------------------------------------
+# Text from Google Cloud Speech-to-Text (Streaming)
+#
+
+def text_from_google_cloud(
+    *,
+    google_cloud_credentials: str,
+    google_cloud_model: str,
+    google_cloud_language: str,
+    google_cloud_profanity_filter: bool,
+    google_cloud_punctuation: bool,
+    google_cloud_use_enhanced: bool,
+    exit_fn: Callable[..., int],
+    process_fn: Callable[[str], str],
+    handle_fn: Callable[[int, str], None],
+    timeout: float,
+    idle_time: float,
+    progressive: bool,
+    progressive_continuous: bool,
+    sample_rate: int,
+    input_method: str,
+    pulse_device_name: str = "",
+    suspend_on_start: bool = False,
+    verbose: int = 0,
+) -> bool:
+    """
+    Text from Google Cloud Speech-to-Text API using streaming recognition.
+    """
+    # Set up logging
+    logger = logging.getLogger("google_cloud_speech")
+    if verbose >= 2:
+        logger.setLevel(logging.DEBUG)
+    elif verbose >= 1:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
+
+    # Create console handler if not exists
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('[%(levelname)s] %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    logger.info("=== Google Cloud Speech-to-Text Engine Started (Streaming) ===")
+    logger.info(f"Model: {google_cloud_model}")
+    logger.info(f"Language: {google_cloud_language}")
+    logger.info(f"Sample rate: {sample_rate} Hz")
+    logger.info(f"Progressive mode: {progressive}")
+    logger.info(f"Automatic punctuation: {google_cloud_punctuation}")
+    logger.info("=============================================================")
+    
+    # Recommend 16kHz for streaming
+    if sample_rate != 16000:
+        logger.warning(f"Sample rate {sample_rate} Hz detected. Google Cloud streaming works best with 16000 Hz.")
+        logger.warning("Consider using --sample-rate=16000 for better results.")
+
+    import threading
+    import queue
+    import signal
+    
+    try:
+        from google.cloud import speech
+    except ImportError:
+        sys.stderr.write("google-cloud-speech package not found. Install with: pip install google-cloud-speech\n")
+        sys.exit(1)
+
+    # Set up authentication
+    if google_cloud_credentials:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = google_cloud_credentials
+        logger.info(f"Using credentials file: {google_cloud_credentials}")
+    elif "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+        sys.stderr.write("Google Cloud credentials are required. Set GOOGLE_APPLICATION_CREDENTIALS environment variable or use --google-cloud-credentials.\n")
+        sys.exit(1)
+
+    # Initialize the Speech client
+    try:
+        client = speech.SpeechClient()
+        logger.info("Successfully initialized Google Cloud Speech client")
+    except Exception as e:
+        sys.stderr.write(f"Failed to initialize Google Cloud Speech client: {e}\n")
+        sys.exit(1)
+
+    # Streaming audio queue
+    audio_queue: queue.Queue = queue.Queue()
+    
+    # State variables
+    if not (progressive and progressive_continuous):
+        text_list: List[str] = []
+    
+    handled_any = False
+    if progressive:
+        text_prev = ""
+    
+    # For timeout functionality
+    use_timeout = timeout != 0.0
+    if use_timeout:
+        timeout_time_prev = time.time()
+
+    # -----------------------------
+    # Utilities for Text Processing
+
+    def handle_fn_suspended() -> None:
+        nonlocal handled_any
+        nonlocal text_prev
+        
+        handled_any = False
+        if progressive:
+            text_prev = ""
+        
+        if not (progressive and progressive_continuous):
+            text_list.clear()
+
+    def handle_fn_wrapper(text: str, is_final: bool) -> None:
+        nonlocal handled_any
+        nonlocal text_prev
+        nonlocal timeout_time_prev
+
+        if not text:
+            return
+
+        # Update timeout tracking
+        if use_timeout and text:
+            timeout_time_prev = time.time()
+
+        # Non-progressive mode: only handle final results
+        if not progressive:
+            if is_final:
+                text_list.append(text)
+                handled_any = True
+            return
+
+        # Progressive mode
+        if progressive_continuous:
+            # Show everything immediately
+            text_curr = process_fn(text)
+        else:
+            # Accumulate text
+            if is_final:
+                text_list.append(text)
+                text_curr = process_fn(" ".join(text_list))
+            else:
+                # Show interim results
+                text_curr = process_fn(" ".join(text_list + [text]))
+
+        if text_curr != text_prev:
+            match = 0
+            for i in range(min(len(text_curr), len(text_prev))):
+                if text_curr[i] != text_prev[i]:
+                    match = i
+                    break
+            else:
+                match = min(len(text_curr), len(text_prev))
+
+            # Emit text, deleting any previous incorrectly transcribed output
+            handle_fn(len(text_prev) - match, text_curr[match:])
+            text_prev = text_curr
+
+        if is_final and progressive_continuous:
+            text_prev = ""
+
+        handled_any = True
+
+    # -----------------------------------------------
+    # Streaming Recognition
+
+    def audio_generator():
+        """Generator that yields audio chunks from the queue."""
+        while True:
+            # Use a timeout to allow checking exit conditions
+            try:
+                chunk = audio_queue.get(timeout=0.1)
+                if chunk is None:  # Poison pill
+                    logger.debug("Audio generator received stop signal")
+                    return
+                yield chunk
+            except queue.Empty:
+                continue
+
+    def streaming_recognize():
+        """Perform streaming speech recognition."""
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=sample_rate,
+            language_code=google_cloud_language,
+            model=google_cloud_model,
+            use_enhanced=google_cloud_use_enhanced,
+            profanity_filter=google_cloud_profanity_filter,
+            enable_automatic_punctuation=google_cloud_punctuation,
+        )
+
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=config,
+            interim_results=True,  # Get partial results
+        )
+
+        # Create request generator for audio data only
+        def request_generator():
+            # Yield audio data chunks
+            for chunk in audio_generator():
+                if chunk:
+                    yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+        try:
+            logger.info("Starting streaming recognition...")
+            # Pass streaming_config as positional argument, requests as keyword
+            responses = client.streaming_recognize(
+                streaming_config,
+                requests=request_generator(),
+            )
+            
+            for response in responses:
+                if not response.results:
+                    continue
+
+                # The first result is the most likely
+                result = response.results[0]
+                if not result.alternatives:
+                    continue
+
+                transcript = result.alternatives[0].transcript
+                
+                # Log the transcript
+                if result.is_final:
+                    logger.info(f"Final: '{transcript}'")
+                    handle_fn_wrapper(transcript, is_final=True)
+                else:
+                    logger.debug(f"Interim: '{transcript}'")
+                    if progressive:  # Only show interim results in progressive mode
+                        handle_fn_wrapper(transcript, is_final=False)
+
+        except Exception as e:
+            logger.error(f"Streaming recognition error: {e}")
+            if "OUT_OF_RANGE" in str(e) and "exceeded maximum allowed stream duration" in str(e):
+                logger.info("Stream duration limit reached. This is normal for long recordings.")
+            else:
+                import traceback
+                logger.debug(f"Traceback:\n{traceback.format_exc()}")
+
+    def recording_proc_start() -> "Tuple[subprocess.Popen[bytes], IO[bytes]]":
+        return recording_proc_with_non_blocking_stdout(input_method, sample_rate, pulse_device_name)
+
+    has_ps = False
+    if not suspend_on_start:
+        ps, stdout = recording_proc_start()
+        has_ps = True
+
+    if not suspend_on_start:
+        # Support setting up input simulation state.
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
+
+    # Use code to delay exiting
+    code = 0
+
+    # ---------------
+    # Signal Handling
+
+    suspend = suspend_on_start
+    from types import FrameType
+
+    def do_suspend_pause() -> None:
+        nonlocal has_ps, ps, stdout
+
+        if not has_ps:
+            sys.stderr.write("Error, no active process to cancel (should never happen!)\n")
+            return
+
+        os.kill(ps.pid, signal.SIGINT)
+        del ps, stdout
+        has_ps = False
+
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
+        handle_fn_suspended()
+
+    def do_suspend_resume() -> None:
+        nonlocal has_ps, ps, stdout
+
+        if has_ps:
+            sys.stderr.write("Error, an active process is running, this should not happen!\n")
+            return
+
+        ps, stdout = recording_proc_start()
+        has_ps = True
+
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "SETUP")
+
+    def handle_sig_exit_from_usr2(sig: int, _frame: Optional[FrameType]) -> None:
+        nonlocal code
+        if verbose >= 1:
+            logger.info("Exit (SIG %d)" % (sig,))
+        code = sig
+        # Send poison pill to stop streaming
+        audio_queue.put(None)
+
+    def handle_sig_suspend_from_usr1(sig: int, _frame: Optional[FrameType]) -> None:
+        nonlocal suspend
+        suspend = not suspend
+        if verbose >= 1:
+            logger.info("%s (SIG %d)" % (("Suspend", "Resume")[not suspend], sig))
+
+        if suspend:
+            do_suspend_pause()
+
+    def handle_sig_resume_from_cont(sig: int, _frame: Optional[FrameType]) -> None:
+        nonlocal suspend
+        if suspend:
+            suspend = False
+            if verbose >= 1:
+                logger.info("Resume (SIG %d)" % (sig,))
+
+    signal.signal(signal.SIGUSR1, handle_sig_suspend_from_usr1)
+    signal.signal(signal.SIGCONT, handle_sig_resume_from_cont)
+    signal.signal(signal.SIGUSR2, handle_sig_exit_from_usr2)
+
+    # -------------
+    # Main Function
+
+    # Start streaming recognition thread
+    logger.info("Starting streaming recognition thread...")
+    recognition_thread = threading.Thread(target=streaming_recognize, daemon=True)
+    recognition_thread.start()
+
+    try:
+        # Use smaller chunks for lower latency
+        block_size = 1024  # 1KB chunks for streaming
+
+        if suspend:
+            do_suspend_pause()
+
+        while code == 0:
+            # Check exit condition
+            code = exit_fn(handled_any)
+            if code != 0:
+                logger.debug(f"Exit condition met, code: {code}")
+                break
+                
+            # Suspended, just wait
+            if suspend:
+                time.sleep(0.1)
+                continue
+
+            # Handle timeout
+            if use_timeout:
+                if time.time() - timeout_time_prev > timeout:
+                    logger.info("Timeout reached: {:.2f}".format(timeout))
+                    break
+
+            # Read audio data
+            try:
+                if has_ps:
+                    data = stdout.read(block_size)
+                    if data:
+                        # Feed audio to streaming recognition
+                        audio_queue.put(data)
+                        if verbose >= 2:
+                            logger.debug(f"Read {len(data)} bytes from audio input")
+                else:
+                    # Start recording if not active
+                    do_suspend_resume()
+                    continue
+
+            except (NameError, ValueError):
+                # Start recording if stdout is not yet open or was closed
+                do_suspend_resume()
+                continue
+
+    except KeyboardInterrupt:
+        code = -1
+    except Exception as ex:
+        sys.stderr.write(f"Error in main loop: {ex}\n")
+        code = -1
+    finally:
+        # Cleanup
+        logger.info("Cleaning up...")
+        audio_queue.put(None)  # Stop streaming
+        
+        if recognition_thread.is_alive():
+            recognition_thread.join(timeout=2.0)
+
+        if has_ps:
+            os.kill(ps.pid, signal.SIGINT)
+            del ps, stdout
+            has_ps = False
+
+        handle_fn(SIMULATE_INPUT_CODE_COMMAND, "TEARDOWN")
+
+    if code == -1:
+        sys.stderr.write("Text input canceled!\n")
+        sys.exit(0)
+
+    if not progressive:
+        # Handle any remaining text
+        handle_fn(0, process_fn(" ".join(text_list)))
+
+    return handled_any
+
+
 def main_begin(
     *,
     vosk_model_dir: str,
@@ -2865,6 +3262,12 @@ def main_begin(
     voxtral_model: str = "voxtral-mini-2507",
     voxtral_silence_duration: float = 2.0,
     voxtral_silence_threshold: float = 0.01,
+    google_cloud_credentials: str = "",
+    google_cloud_model: str = "latest_long",
+    google_cloud_language: str = "en-US",
+    google_cloud_profanity_filter: bool = False,
+    google_cloud_punctuation: bool = True,
+    google_cloud_use_enhanced: bool = False,
 ) -> None:
     """
     Initialize audio recording, then full text to speech conversion can take place.
@@ -3093,6 +3496,27 @@ def main_begin(
             voxtral_model=voxtral_model,
             voxtral_silence_duration=voxtral_silence_duration,
             voxtral_silence_threshold=voxtral_silence_threshold,
+            exit_fn=exit_fn,
+            process_fn=process_fn,
+            handle_fn=handle_fn,
+            timeout=timeout,
+            idle_time=idle_time,
+            progressive=progressive,
+            progressive_continuous=progressive_continuous,
+            sample_rate=sample_rate,
+            input_method=input_method,
+            pulse_device_name=pulse_device_name,
+            suspend_on_start=suspend_on_start,
+            verbose=verbose,
+        )
+    elif speech_engine == "GOOGLE_CLOUD":
+        found_any = text_from_google_cloud(
+            google_cloud_credentials=google_cloud_credentials,
+            google_cloud_model=google_cloud_model,
+            google_cloud_language=google_cloud_language,
+            google_cloud_profanity_filter=google_cloud_profanity_filter,
+            google_cloud_punctuation=google_cloud_punctuation,
+            google_cloud_use_enhanced=google_cloud_use_enhanced,
             exit_fn=exit_fn,
             process_fn=process_fn,
             handle_fn=handle_fn,
@@ -3435,9 +3859,9 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
         default="VOSK",
         type=str,
         metavar="SPEECH_ENGINE",
-        choices=("VOSK", "ASSEMBLYAI", "FASTER_WHISPER", "OPENAI_WHISPER", "VOXTRAL"),
+        choices=("VOSK", "ASSEMBLYAI", "FASTER_WHISPER", "OPENAI_WHISPER", "VOXTRAL", "GOOGLE_CLOUD"),
         help=(
-            "Specify speech recognition engine to use. Valid engines: VOSK, ASSEMBLYAI, FASTER_WHISPER, OPENAI_WHISPER, VOXTRAL.\n"
+            "Specify speech recognition engine to use. Valid engines: VOSK, ASSEMBLYAI, FASTER_WHISPER, OPENAI_WHISPER, VOXTRAL, GOOGLE_CLOUD.\n"
             "\n"
             "- ``VOSK`` (VOSK-API, default)\n"
             "  Uses local VOSK models for offline speech recognition.\n"
@@ -3449,6 +3873,8 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             "  Uses OpenAI's cloud-based Whisper API for speech recognition.\n"
             "- ``VOXTRAL`` (Voxtral/Mistral API)\n"
             "  Uses Mistral's Voxtral API with silence-based audio segmentation.\n"
+            "- ``GOOGLE_CLOUD`` (Google Cloud Speech-to-Text)\n"
+            "  Uses Google Cloud's Speech-to-Text API with the latest_long model for accurate transcription.\n"
         ),
         required=False,
     )
@@ -3686,6 +4112,84 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     )
 
     subparse.add_argument(
+        "--google-cloud-credentials",
+        dest="google_cloud_credentials",
+        default="",
+        type=str,
+        metavar="PATH",
+        help=(
+            "Path to Google Cloud service account JSON credentials file.\n"
+            "Required for ``--speech-engine=GOOGLE_CLOUD``.\n"
+            "Can also be set via GOOGLE_APPLICATION_CREDENTIALS environment variable."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--google-cloud-model",
+        dest="google_cloud_model",
+        default="latest_long",
+        type=str,
+        metavar="MODEL",
+        help=(
+            "Google Cloud Speech model to use.\n"
+            "Default is 'latest_long'. Other options: 'latest_short', 'command_and_search', 'default'.\n"
+            "Used with ``--speech-engine=GOOGLE_CLOUD``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--google-cloud-language",
+        dest="google_cloud_language",
+        default="en-US",
+        type=str,
+        metavar="LANG",
+        help=(
+            "Language code for Google Cloud Speech (e.g., 'en-US', 'es-ES', 'fr-FR').\n"
+            "Default is 'en-US'. See Google Cloud docs for supported languages.\n"
+            "Used with ``--speech-engine=GOOGLE_CLOUD``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--google-cloud-profanity-filter",
+        dest="google_cloud_profanity_filter",
+        default=False,
+        action="store_true",
+        help=(
+            "Enable profanity filtering in transcription results.\n"
+            "Used with ``--speech-engine=GOOGLE_CLOUD``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--google-cloud-punctuation",
+        dest="google_cloud_punctuation",
+        default=True,
+        action="store_true",
+        help=(
+            "Enable automatic punctuation in transcription results.\n"
+            "Default is True. Used with ``--speech-engine=GOOGLE_CLOUD``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--google-cloud-use-enhanced",
+        dest="google_cloud_use_enhanced",
+        default=False,
+        action="store_true",
+        help=(
+            "Use enhanced models for better accuracy (may incur additional cost).\n"
+            "Used with ``--speech-engine=GOOGLE_CLOUD``."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
         "-",
         dest="rest",
         default=False,
@@ -3734,6 +4238,12 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             voxtral_model=args.voxtral_model,
             voxtral_silence_duration=args.voxtral_silence_duration,
             voxtral_silence_threshold=args.voxtral_silence_threshold,
+            google_cloud_credentials=args.google_cloud_credentials,
+            google_cloud_model=args.google_cloud_model,
+            google_cloud_language=args.google_cloud_language,
+            google_cloud_profanity_filter=args.google_cloud_profanity_filter,
+            google_cloud_punctuation=args.google_cloud_punctuation,
+            google_cloud_use_enhanced=args.google_cloud_use_enhanced,
         ),
     )
 
